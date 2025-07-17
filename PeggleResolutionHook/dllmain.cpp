@@ -1,98 +1,254 @@
 ﻿#include "pch.h"
 #include <Windows.h>
+#include <cstdio>
+#include <cstdint>
+#include <cmath>
 #include <detours.h>
+#include <TlHelp32.h>
+#include <fstream>
+#include <Psapi.h>
+#include <cstdarg>
+#include <string>
 
-const UINT32 TARGET_WIDTH = 1280;
-const UINT32 TARGET_HEIGHT = 720;
-const char* TARGET_WINDOW_CLASS = "PopcapWindowClass";
+constexpr DWORD DESIRED_WIDTH = 1280;
+constexpr DWORD DESIRED_HEIGHT = 720;
+constexpr const char* TARGET_PROCESS = "Peggle.exe";
+constexpr const char* TARGET_CLASS = "PeggleClass";
+constexpr DWORD MAX_WAIT_TIME = 10000;
 
-typedef HWND(WINAPI* CreateWindowExA_t)(DWORD, LPCSTR, LPCSTR, DWORD, int, int, int, int, HWND, HMENU, HINSTANCE, LPVOID);
-typedef BOOL(WINAPI* SetWindowPos_t)(HWND, HWND, int, int, int, int, UINT);
-typedef BOOL(WINAPI* AdjustWindowRect_t)(LPRECT, DWORD, BOOL);
+std::ofstream logFile;
+uintptr_t g_peggleBase = 0;
+DWORD g_pegglePID = 0;
 
-CreateWindowExA_t Original_CreateWindowExA = nullptr;
-SetWindowPos_t Original_SetWindowPos = nullptr;
-AdjustWindowRect_t Original_AdjustWindowRect = nullptr;
-bool g_ResolutionSet = false;
+void Log(const char* format, ...) {
+    if (!logFile.is_open()) return;
 
-BOOL WINAPI Hooked_AdjustWindowRect(LPRECT lpRect, DWORD dwStyle, BOOL bMenu) {
-    if (g_ResolutionSet && lpRect) {
-        lpRect->right = TARGET_WIDTH + (lpRect->right - lpRect->left);
-        lpRect->bottom = TARGET_HEIGHT + (lpRect->bottom - lpRect->top);
-        return TRUE;
-    }
-    return Original_AdjustWindowRect(lpRect, dwStyle, bMenu);
+    char buffer[1024];
+    va_list args;
+    va_start(args, format);
+    vsprintf_s(buffer, sizeof(buffer), format, args);
+    va_end(args);
+
+    logFile << buffer << std::endl;
+    logFile.flush();
 }
 
-BOOL WINAPI Hooked_SetWindowPos(HWND hWnd, HWND hWndInsertAfter, int X, int Y, int cx, int cy, UINT uFlags) {
-    char className[256];
-    if (GetClassNameA(hWnd, className, sizeof(className))) {
-        if (strcmp(className, TARGET_WINDOW_CLASS) == 0) {
-            // Force target resolution
-            cx = TARGET_WIDTH;
-            cy = TARGET_HEIGHT;
+DWORD FindPeggleProcess() {
+    PROCESSENTRY32 pe32;
+    pe32.dwSize = sizeof(PROCESSENTRY32);
 
-            // Center window
-                X = (GetSystemMetrics(SM_CXSCREEN) - cx) / 2;
-                Y = (GetSystemMetrics(SM_CYSCREEN) - cy) / 2;
+    HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (hSnapshot == INVALID_HANDLE_VALUE) {
+        Log("CreateToolhelp32Snapshot failed: %d", GetLastError());
+        return 0;
+    }
 
-                g_ResolutionSet = true;
+    if (!Process32First(hSnapshot, &pe32)) {
+        CloseHandle(hSnapshot);
+        Log("Process32First failed: %d", GetLastError());
+        return 0;
+    }
+
+    do {
+        if (_stricmp(pe32.szExeFile, TARGET_PROCESS) == 0) {
+            g_pegglePID = pe32.th32ProcessID;
+            Log("Found Peggle process: PID=%d", g_pegglePID);
+            CloseHandle(hSnapshot);
+            return g_pegglePID;
+        }
+    } while (Process32Next(hSnapshot, &pe32));
+
+    CloseHandle(hSnapshot);
+    Log("Peggle process not found");
+    return 0;
+}
+
+uintptr_t GetPeggleBaseAddress() {
+    if (!g_pegglePID) return 0;
+
+    HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, g_pegglePID);
+    if (!hProcess) {
+        Log("OpenProcess failed: %d", GetLastError());
+        return 0;
+    }
+
+    HMODULE hMods[1024];
+    DWORD cbNeeded;
+
+    if (EnumProcessModules(hProcess, hMods, sizeof(hMods), &cbNeeded)) {
+        char modName[MAX_PATH];
+        for (DWORD i = 0; i < (cbNeeded / sizeof(HMODULE)); i++) {
+            if (GetModuleFileNameExA(hProcess, hMods[i], modName, sizeof(modName))) {
+                if (strstr(modName, TARGET_PROCESS)) {
+                    g_peggleBase = (uintptr_t)hMods[i];
+                    Log("Peggle base address: 0x%p", (void*)g_peggleBase);
+                    CloseHandle(hProcess);
+                    return g_peggleBase;
+                }
+            }
         }
     }
-    return Original_SetWindowPos(hWnd, hWndInsertAfter, X, Y, cx, cy, uFlags);
-}
-
-// Hooked CreateWindowExA
-HWND WINAPI Hooked_CreateWindowExA(DWORD dwExStyle, LPCSTR lpClassName, LPCSTR lpWindowName, DWORD dwStyle,
-    int X, int Y, int nWidth, int nHeight, HWND hWndParent, HMENU hMenu,
-    HINSTANCE hInstance, LPVOID lpParam) {
-    if (lpClassName && strcmp(lpClassName, TARGET_WINDOW_CLASS) == 0) {
-        // Force target resolution
-        nWidth = TARGET_WIDTH;
-        nHeight = TARGET_HEIGHT;
-
-        // Center window
-        X = (GetSystemMetrics(SM_CXSCREEN) - nWidth) / 2;
-        Y = (GetSystemMetrics(SM_CYSCREEN) - nHeight) / 2;
-
-        g_ResolutionSet = true;
-    }
-    return Original_CreateWindowExA(dwExStyle, lpClassName, lpWindowName, dwStyle,
-        X, Y, nWidth, nHeight, hWndParent, hMenu, hInstance, lpParam);
-}
-
-void InstallHooks() {
-    DetourTransactionBegin();
-    DetourUpdateThread(GetCurrentThread());
-
-    HMODULE user32 = GetModuleHandleA("user32.dll");
-    if (user32) {
-        Original_AdjustWindowRect = (AdjustWindowRect_t)GetProcAddress(user32, "AdjustWindowRect");
-        Original_CreateWindowExA = (CreateWindowExA_t)GetProcAddress(user32, "CreateWindowExA");
-        Original_SetWindowPos = (SetWindowPos_t)GetProcAddress(user32, "SetWindowPos");
-
-        if (Original_AdjustWindowRect) DetourAttach((PVOID*)&Original_AdjustWindowRect, Hooked_AdjustWindowRect);
-        if (Original_CreateWindowExA) DetourAttach((PVOID*)&Original_CreateWindowExA, Hooked_CreateWindowExA);
-        if (Original_SetWindowPos) DetourAttach((PVOID*)&Original_SetWindowPos, Hooked_SetWindowPos);
+    else {
+        Log("EnumProcessModules failed: %d", GetLastError());
     }
 
-    DetourTransactionCommit();
+    CloseHandle(hProcess);
+    return 0;
 }
 
-// Initialization thread
+uintptr_t CalculatePeggleAddress(uintptr_t offset) {
+    if (!g_peggleBase) {
+        Log("Cannot calculate address: base not set");
+        return 0;
+    }
+
+    // Adjust for ASLR: offset - default base (0x400000) + actual base
+    uintptr_t actualAddr = g_peggleBase + (offset - 0x00400000);
+    Log("Calculated address: 0x%p = 0x%p + (0x%p - 0x00400000)",
+        (void*)actualAddr, (void*)g_peggleBase, (void*)offset);
+
+    return actualAddr;
+}
+
+bool PatchMemory(uintptr_t address, uint32_t value) {
+    if (!g_pegglePID) {
+        Log("PatchMemory failed: no PID");
+        return false;
+    }
+
+    HANDLE hProcess = OpenProcess(PROCESS_VM_OPERATION | PROCESS_VM_WRITE | PROCESS_VM_READ, FALSE, g_pegglePID);
+    if (!hProcess) {
+        Log("OpenProcess failed: %d", GetLastError());
+        return false;
+    }
+
+    uint32_t originalValue = 0;
+    SIZE_T bytesRead;
+    if (ReadProcessMemory(hProcess, (LPCVOID)address, &originalValue, sizeof(originalValue), &bytesRead)) {
+        Log("Original value at 0x%p: %d (0x%X)", (void*)address, originalValue, originalValue);
+    }
+    else {
+        Log("ReadProcessMemory failed: %d", GetLastError());
+    }
+
+    DWORD oldProtect;
+    if (!VirtualProtectEx(hProcess, (LPVOID)address, sizeof(value), PAGE_EXECUTE_READWRITE, &oldProtect)) {
+        Log("VirtualProtectEx failed: %d", GetLastError());
+        CloseHandle(hProcess);
+        return false;
+    }
+
+    SIZE_T bytesWritten;
+    if (!WriteProcessMemory(hProcess, (LPVOID)address, &value, sizeof(value), &bytesWritten)) {
+        Log("WriteProcessMemory failed: %d", GetLastError());
+        CloseHandle(hProcess);
+        return false;
+    }
+
+    // Verify write
+    uint32_t newValue = 0;
+    if (ReadProcessMemory(hProcess, (LPCVOID)address, &newValue, sizeof(newValue), &bytesRead)) {
+        Log("New value at 0x%p: %d (0x%X)", (void*)address, newValue, newValue);
+    }
+
+    VirtualProtectEx(hProcess, (LPVOID)address, sizeof(value), oldProtect, &oldProtect);
+    CloseHandle(hProcess);
+
+    if (newValue == value) {
+        Log("Successfully patched 0x%p: %d -> %d", (void*)address, originalValue, value);
+        return true;
+    }
+
+    Log("Patch verification failed");
+    return false;
+}
+
+// Window management
+void CenterGameWindow() {
+    HWND hwnd = FindWindowA(TARGET_CLASS, NULL);
+    if (!hwnd) {
+        Log("Game window not found");
+        return;
+    }
+
+    RECT rc;
+    GetWindowRect(hwnd, &rc);
+    int width = rc.right - rc.left;
+    int height = rc.bottom - rc.top;
+
+    int screenWidth = GetSystemMetrics(SM_CXSCREEN);
+    int screenHeight = GetSystemMetrics(SM_CYSCREEN);
+
+    int x = (screenWidth - DESIRED_WIDTH) / 2;
+    int y = (screenHeight - DESIRED_HEIGHT) / 2;
+
+    if (width != DESIRED_WIDTH || height != DESIRED_HEIGHT || rc.left != x || rc.top != y) {
+        Log("Adjusting window: %dx%d -> %dx%d at (%d,%d)",
+            width, height, DESIRED_WIDTH, DESIRED_HEIGHT, x, y);
+
+        SetWindowPos(hwnd, NULL, x, y, DESIRED_WIDTH, DESIRED_HEIGHT,
+            SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
+    }
+}
+
+// Timer callback for window management
+VOID CALLBACK TimerProc(HWND hwnd, UINT uMsg, UINT_PTR idEvent, DWORD dwTime) {
+    CenterGameWindow();
+}
+
+void ApplyResolutionPatches() {
+    // Get absolute addresses
+    uintptr_t widthAddr = CalculatePeggleAddress(0x0055E034);
+    uintptr_t heightAddr = CalculatePeggleAddress(0x0055E038);
+
+    if (!widthAddr || !heightAddr) {
+        Log("Failed to calculate addresses");
+        return;
+    }
+
+    // Patch memory
+    PatchMemory(widthAddr, DESIRED_WIDTH);
+    PatchMemory(heightAddr, DESIRED_HEIGHT);
+
+    // Set up periodic window centering
+    SetTimer(NULL, 0, 1000, TimerProc);
+}
+
 DWORD WINAPI InitThread(LPVOID) {
-    for (int i = 0; i < 50; i++) {
-        if (GetModuleHandleA("user32.dll")) break;
-        Sleep(100);
+    // Initialize logging
+    logFile.open("PeggleResolutionHook.log", std::ios::out | std::ios::trunc);
+    Log("==== Peggle Resolution Hook Initializing ====");
+
+    // Wait for Peggle to launch
+    DWORD startTime = GetTickCount();
+    while (GetTickCount() - startTime < MAX_WAIT_TIME) {
+        if (FindPeggleProcess() && GetPeggleBaseAddress()) {
+            break;
+        }
+        Sleep(500);
     }
-    InstallHooks();
+
+    if (!g_pegglePID || !g_peggleBase) {
+        Log("Failed to locate Peggle process");
+        return 0;
+    }
+
+    // Apply patches and set up window management
+    ApplyResolutionPatches();
+
+    Log("==== Hook Initialization Complete ====");
     return 0;
 }
 
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID lpReserved) {
     if (reason == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(hModule);
-        CreateThread(nullptr, 0, InitThread, nullptr, 0, nullptr);
+        HANDLE hThread = CreateThread(nullptr, 0, InitThread, nullptr, 0, nullptr);
+        if (hThread) CloseHandle(hThread);
+    }
+    else if (reason == DLL_PROCESS_DETACH) {
+        Log("DLL unloaded");
+        if (logFile.is_open()) logFile.close();
     }
     return TRUE;
 }
