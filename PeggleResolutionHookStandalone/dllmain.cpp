@@ -3,20 +3,33 @@
 #include <cstdio>
 #include <cstdint>
 #include <fstream>
-#include <vector>
-#include <string>
-#include <cwctype>
-#include <algorithm>
+#include <d3d9.h>
+#include <detours.h>
 #include <Psapi.h>
+
+#pragma comment(lib, "d3d9.lib")
+#pragma comment(lib, "detours.lib")
+#pragma comment(lib, "Psapi.lib")
 
 // Configuration
 constexpr DWORD DESIRED_WIDTH = 1280;
-constexpr DWORD DESIRED_HEIGHT = 720;
-constexpr const char* GAME_EXECUTABLE = "Peggle.exe";
-constexpr const wchar_t* GAME_WINDOW_CLASS = L"POPFramework";  // Most common class name
+constexpr DWORD DESIRED_HEIGHT = 960;
+constexpr const wchar_t* WINDOW_CLASS = L"MainWindow";
 
-// Global log file
+// Global variables
 std::ofstream logFile;
+IDirect3DDevice9* pDevice = nullptr;
+bool g_hooksInstalled = false;
+
+// Function prototypes
+typedef HRESULT(APIENTRY* Present_t)(IDirect3DDevice9*, const RECT*, const RECT*, HWND, const RGNDATA*);
+typedef HRESULT(APIENTRY* Reset_t)(IDirect3DDevice9*, D3DPRESENT_PARAMETERS*);
+typedef HRESULT(APIENTRY* CreateDevice_t)(IDirect3D9*, UINT, D3DDEVTYPE, HWND, DWORD, D3DPRESENT_PARAMETERS*, IDirect3DDevice9**);
+
+// Original functions
+Present_t OriginalPresent = nullptr;
+Reset_t OriginalReset = nullptr;
+CreateDevice_t OriginalCreateDevice = nullptr;
 
 // Logging function
 void Log(const char* format, ...) {
@@ -28,58 +41,22 @@ void Log(const char* format, ...) {
 
     if (logFile.is_open()) {
         logFile << buffer << std::endl;
-        logFile.flush();
     }
     OutputDebugStringA(buffer);
 }
 
-// Convert wide string to lower case
-std::wstring to_lower(const std::wstring& str) {
-    std::wstring lower = str;
-    std::transform(lower.begin(), lower.end(), lower.begin(), ::towlower);
-    return lower;
-}
-
-// Find the actual Peggle game window
-HWND FindPeggleWindow() {
-    HWND hwnd = nullptr;
-
-    // Enumerate all top-level windows
-    EnumWindows([](HWND hwnd, LPARAM lParam) -> BOOL {
-        // Check if window is visible
-        if (!IsWindowVisible(hwnd)) return TRUE;
-
-        // Get process ID
-        DWORD processId;
-        GetWindowThreadProcessId(hwnd, &processId);
-
-        // Get process name
-        HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, processId);
-        if (!hProcess) return TRUE;
-
-        wchar_t processName[MAX_PATH] = L"";
-        if (GetModuleFileNameExW(hProcess, NULL, processName, MAX_PATH)) {
-            std::wstring lowerName = to_lower(processName);
-            if (lowerName.find(L"peggle") != std::wstring::npos) {
-                *reinterpret_cast<HWND*>(lParam) = hwnd;
-                CloseHandle(hProcess);
-                return FALSE; // Stop enumeration
-            }
-        }
-        CloseHandle(hProcess);
-        return TRUE;
-        }, reinterpret_cast<LPARAM>(&hwnd));
-
-    return hwnd;
-}
-
 // Force window size and position
-void SetGameWindowSize() {
-    HWND hwnd = FindPeggleWindow();
+void ResizeGameWindow() {
+    HWND hwnd = FindWindowW(WINDOW_CLASS, nullptr);
     if (!hwnd) {
         Log("Game window not found");
         return;
     }
+
+    // Get window title for debugging
+    wchar_t title[256] = L"";
+    GetWindowTextW(hwnd, title, 256);
+    Log("Resizing window: %ls", title);
 
     // Get current window style
     LONG style = GetWindowLongW(hwnd, GWL_STYLE);
@@ -104,26 +81,133 @@ void SetGameWindowSize() {
     SetWindowPos(hwnd, NULL, x, y, width, height,
         SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
 
-    Log("Set window size to %dx%d (position: %d, %d)", width, height, x, y);
+    Log("Window resized to %dx%d", width, height);
+}
 
-    // Get window class for debugging
-    wchar_t className[256] = L"";
-    GetClassNameW(hwnd, className, 256);
-    Log("Game window class: %ls", className);
+// Direct3D hook to modify presentation parameters
+HRESULT APIENTRY PresentHook(IDirect3DDevice9* pDevice,
+    const RECT* pSourceRect,
+    const RECT* pDestRect,
+    HWND hDestWindowOverride,
+    const RGNDATA* pDirtyRegion) {
+    return OriginalPresent(pDevice, pSourceRect, pDestRect, hDestWindowOverride, pDirtyRegion);
+}
+
+// Direct3D hook to handle device reset
+HRESULT APIENTRY ResetHook(IDirect3DDevice9* pDevice,
+    D3DPRESENT_PARAMETERS* pPresentationParameters) {
+    Log("Reset called - modifying resolution");
+
+    // Force desired resolution
+    pPresentationParameters->BackBufferWidth = DESIRED_WIDTH;
+    pPresentationParameters->BackBufferHeight = DESIRED_HEIGHT;
+    pPresentationParameters->Windowed = TRUE;
+
+    // Call original reset
+    HRESULT hr = OriginalReset(pDevice, pPresentationParameters);
+    if (SUCCEEDED(hr)) {
+        Log("Resolution set to %dx%d", DESIRED_WIDTH, DESIRED_HEIGHT);
+    }
+    else {
+        Log("Reset failed: 0x%X", hr);
+    }
+    return hr;
+}
+
+// Hook for device creation
+HRESULT APIENTRY CreateDeviceHook(IDirect3D9* pD3D,
+    UINT Adapter,
+    D3DDEVTYPE DeviceType,
+    HWND hFocusWindow,
+    DWORD BehaviorFlags,
+    D3DPRESENT_PARAMETERS* pPresentationParameters,
+    IDirect3DDevice9** ppReturnedDeviceInterface) {
+    Log("CreateDevice called - modifying resolution");
+
+    // Force desired resolution
+    pPresentationParameters->BackBufferWidth = DESIRED_WIDTH;
+    pPresentationParameters->BackBufferHeight = DESIRED_HEIGHT;
+    pPresentationParameters->Windowed = TRUE;
+
+    // Call original CreateDevice
+    HRESULT hr = OriginalCreateDevice(pD3D, Adapter, DeviceType, hFocusWindow, BehaviorFlags,
+        pPresentationParameters, ppReturnedDeviceInterface);
+
+    if (SUCCEEDED(hr)) {
+        Log("Device created at %dx%d", DESIRED_WIDTH, DESIRED_HEIGHT);
+
+        // Get device function addresses
+        void** pVTable = *reinterpret_cast<void***>(*ppReturnedDeviceInterface);
+        OriginalReset = reinterpret_cast<Reset_t>(pVTable[16]);
+        OriginalPresent = reinterpret_cast<Present_t>(pVTable[17]);
+
+        // Prepare hooks
+        DetourTransactionBegin();
+        DetourUpdateThread(GetCurrentThread());
+
+        // Hook Reset and Present functions
+        DetourAttach(&(PVOID&)OriginalReset, ResetHook);
+        DetourAttach(&(PVOID&)OriginalPresent, PresentHook);
+
+        if (DetourTransactionCommit() != NO_ERROR) {
+            Log("Failed to attach device hooks");
+        }
+        else {
+            Log("Device hooks installed");
+            g_hooksInstalled = true;
+        }
+    }
+    else {
+        Log("CreateDevice failed: 0x%X", hr);
+    }
+
+    return hr;
+}
+
+// Hook Direct3D creation
+void HookDirect3D() {
+    // Get Direct3D9 interface
+    IDirect3D9* pD3D = Direct3DCreate9(D3D_SDK_VERSION);
+    if (!pD3D) {
+        Log("Failed to create D3D9 interface");
+        return;
+    }
+
+    // Get vtable
+    void** pVTable = *reinterpret_cast<void***>(pD3D);
+    OriginalCreateDevice = reinterpret_cast<CreateDevice_t>(pVTable[16]); // CreateDevice is index 16
+
+    // Prepare hooks
+    DetourTransactionBegin();
+    DetourUpdateThread(GetCurrentThread());
+    DetourAttach(&(PVOID&)OriginalCreateDevice, CreateDeviceHook);
+
+    if (DetourTransactionCommit() != NO_ERROR) {
+        Log("Failed to attach CreateDevice hook");
+    }
+    else {
+        Log("CreateDevice hook installed");
+    }
+
+    pD3D->Release();
 }
 
 // Main initialization
 void Initialize() {
-    logFile.open("PeggleResolutionHook.log", std::ios::out | std::ios::trunc);
+    logFile.open("PeggleHook.log", std::ios::out | std::ios::trunc);
     Log("==== Peggle Resolution Hook Initialized ====");
 
-    // Set window size immediately
-    SetGameWindowSize();
+    // Initial window resize
+    ResizeGameWindow();
+
+    // Install Direct3D hooks
+    HookDirect3D();
 
     // Set up periodic resizing
-    SetTimer(NULL, 0, 1000, [](HWND, UINT, UINT_PTR, DWORD) {
-        SetGameWindowSize();
-        });
+    while (true) {
+        ResizeGameWindow();
+        Sleep(1000);
+    }
 }
 
 // DLL entry point
@@ -137,6 +221,14 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID lpReserved) {
     }
     else if (reason == DLL_PROCESS_DETACH) {
         Log("DLL unloaded");
+        // Remove hooks if installed
+        if (g_hooksInstalled) {
+            DetourTransactionBegin();
+            DetourUpdateThread(GetCurrentThread());
+            DetourDetach(&(PVOID&)OriginalReset, ResetHook);
+            DetourDetach(&(PVOID&)OriginalPresent, PresentHook);
+            DetourTransactionCommit();
+        }
         if (logFile.is_open()) logFile.close();
     }
     return TRUE;
